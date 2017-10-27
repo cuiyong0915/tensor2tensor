@@ -26,6 +26,8 @@ import time
 import six
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
+from tensor2tensor.data_generators import text_encoder
+from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import beam_search
 from tensor2tensor.utils import expert_utils as eu
 from tensor2tensor.utils import registry
@@ -215,6 +217,8 @@ class T2TModel(object):
                    last_position_only, alpha):
     """Beam search decoding.
 
+    Models should ideally implement a more efficient version of this function.
+
     Args:
       features: an map of string to `Tensor`
       decode_length: an integer.  How many additional timesteps to decode.
@@ -227,7 +231,27 @@ class T2TModel(object):
     Returns:
        samples: an integer `Tensor`. Top samples from the beam search
     """
+    return self._beam_decode_slow(features, decode_length, beam_size, top_beams,
+                                  last_position_only, alpha)
 
+  def _beam_decode_slow(self, features, decode_length, beam_size, top_beams,
+                        last_position_only, alpha):
+    """Slow version of Beam search decoding.
+
+    Quadratic time in decode_length.
+
+    Args:
+      features: an map of string to `Tensor`
+      decode_length: an integer.  How many additional timesteps to decode.
+      beam_size: number of beams.
+      top_beams: an integer. How many of the beams to return.
+      last_position_only: a boolean, speed-up by computing last position only.
+      alpha: Float that controls the length penalty. larger the alpha, stronger
+        the preference for slonger translations.
+
+    Returns:
+       samples: an integer `Tensor`. Top samples from the beam search
+    """
     batch_size = tf.shape(features["inputs"])[0]
     batch_size = tf.Print(batch_size, [batch_size], "beam_decode batch_size=")
 
@@ -258,15 +282,16 @@ class T2TModel(object):
 
     initial_ids = tf.zeros([batch_size], dtype=tf.int32)
 
-    inputs_old = features["inputs"]
-    features["inputs"] = tf.expand_dims(features["inputs"], 1)
-    if len(features["inputs"].shape) < 5:
-      features["inputs"] = tf.expand_dims(features["inputs"], 4)
-    # Expand the inputs in to the beam size.
-    features["inputs"] = tf.tile(features["inputs"], [1, beam_size, 1, 1, 1])
-    s = tf.shape(features["inputs"])
-    features["inputs"] = tf.reshape(features["inputs"],
-                                    [s[0] * s[1], s[2], s[3], s[4]])
+    if self.has_input:
+      inputs_old = features["inputs"]
+      features["inputs"] = tf.expand_dims(features["inputs"], 1)
+      if len(features["inputs"].shape) < 5:
+        features["inputs"] = tf.expand_dims(features["inputs"], 4)
+      # Expand the inputs in to the beam size.
+      features["inputs"] = tf.tile(features["inputs"], [1, beam_size, 1, 1, 1])
+      s = tf.shape(features["inputs"])
+      features["inputs"] = tf.reshape(features["inputs"],
+                                      [s[0] * s[1], s[2], s[3], s[4]])
 
     target_modality = self._hparams.problems[self._problem_idx].target_modality
     vocab_size = target_modality.top_dimensionality
@@ -279,7 +304,8 @@ class T2TModel(object):
                                           alpha)
 
     # Set inputs back to the unexpanded inputs to not to confuse the Estimator!
-    features["inputs"] = inputs_old
+    if self.has_input:
+      features["inputs"] = inputs_old
 
     # Return `top_beams` decodings (also remove initial id from the beam search)
     return_scores = False  # TODO(lukaszkaiser): make it work multi-problem.
@@ -332,6 +358,10 @@ class T2TModel(object):
       features["inputs"] = tf.expand_dims(features["inputs"], 2)
     if not self.has_input:
       features["partial_targets"] = tf.to_int64(features["inputs"])
+    # Save the targets in a var and reassign it after the tf.while loop to avoid
+    # having targets being in a 'while' frame. This ensures targets when used
+    # in metric functions stays in the same frame as other vars.
+    targets_old = features.get("targets", None)
 
     def infer_step(recent_output, recent_logits, unused_loss):
       """Inference step."""
@@ -360,8 +390,9 @@ class T2TModel(object):
     # Create an initial output tensor. This will be passed
     # to the infer_step, which adds one timestep at every iteration.
     if "partial_targets" in features:
-      initial_output = tf.to_int64(tf.expand_dims(
-          tf.expand_dims(features["partial_targets"], 2), 3))
+      initial_output = tf.to_int64(features["partial_targets"])
+      while len(initial_output.get_shape().as_list()) < 4:
+        initial_output = tf.expand_dims(initial_output, 2)
       batch_size = tf.shape(initial_output)[0]
     else:
       batch_size = tf.shape(features["inputs"])[0]
@@ -382,8 +413,38 @@ class T2TModel(object):
     logits.set_shape([None, None, None, None, None])
     loss = 0.0
 
+    def while_exit_cond(result, logits, loss):  # pylint: disable=unused-argument
+      """Exit the loop either if reach decode_length or EOS."""
+      length = tf.shape(result)[1]
+
+      not_overflow = length < decode_length
+
+      if self._problem_hparams.stop_at_eos:
+        def fn_not_eos():
+          return tf.not_equal(  # Check if the last predicted element is a EOS
+              tf.squeeze(result[:, -1, :, :]),
+              text_encoder.EOS_ID
+          )
+
+        not_eos = tf.cond(
+            # We only check for early stoping if there is at least 1 element (
+            # otherwise not_eos will crash)
+            tf.not_equal(length, 0),
+            fn_not_eos,
+            lambda: True,
+        )
+
+        return tf.cond(
+            tf.equal(batch_size, 1),
+            # If batch_size == 1, we check EOS for early stoping
+            lambda: tf.logical_and(not_overflow, not_eos),
+            # Else, just wait for max length
+            lambda: not_overflow
+        )
+      return not_overflow
+
     result, logits, loss = tf.while_loop(
-        lambda result, logits, loss: tf.shape(result)[1] < decode_length,
+        while_exit_cond,
         infer_step, [result, logits, loss],
         shape_invariants=[
             tf.TensorShape([None, None, None, None]),
@@ -394,6 +455,9 @@ class T2TModel(object):
         parallel_iterations=1)
     if inputs_old is not None:  # Restore to not confuse Estimator.
       features["inputs"] = inputs_old
+    # Reassign targets back to the previous value.
+    if targets_old is not None:
+      features["targets"] = targets_old
     losses = {"training": loss}
     if "partial_targets" in features:
       partial_target_length = tf.shape(features["partial_targets"])[1]
@@ -420,15 +484,17 @@ class T2TModel(object):
     else:
       assert self._hparams.sampling_method == "random"
 
-      def _multinomial_squeeze(logits):
-        reshaped_logits = tf.reshape(logits, [-1, tf.shape(logits)[-1]])
+      def _multinomial_squeeze(logits, temperature=1.0):
+        reshaped_logits = (
+            tf.reshape(logits, [-1, tf.shape(logits)[-1]])/temperature)
         choices = tf.multinomial(reshaped_logits, 1)
         choices = tf.reshape(choices,
                              tf.shape(logits)[:logits.get_shape().ndims - 1])
         return choices
 
       sharded_samples = self._data_parallelism(_multinomial_squeeze,
-                                               sharded_logits)
+                                               sharded_logits,
+                                               self._hparams.sampling_temp)
     return tf.concat(sharded_samples, 0), sharded_logits, losses
 
   def _shard_features(self, features):  # pylint: disable=missing-docstring
@@ -514,9 +580,9 @@ class T2TModel(object):
     with tf.variable_scope(target_modality.name, reuse=target_reuse):
       if not last_position_only:
         sharded_logits = target_modality.top_sharded(
-            body_outputs, sharded_features["targets"], self._data_parallelism)
+            body_outputs, sharded_features["targets"], dp)
         training_loss = target_modality.loss_sharded(
-            sharded_logits, sharded_features["targets"], self._data_parallelism)
+            sharded_logits, sharded_features["targets"], dp)
 
         training_loss *= self._problem_hparams.loss_multiplier
       else:
@@ -534,9 +600,60 @@ class T2TModel(object):
                                                      last_position_targets,
                                                      self._data_parallelism)
         training_loss = None
+    losses["training"] = training_loss
+
+    # Scheduled sampling.
+    do_scheduled_sampling = (  # Only do it if training and set for it.
+        self._hparams.scheduled_sampling_prob > 0.0 and
+        self._hparams.mode == tf.estimator.ModeKeys.TRAIN and
+        not skip)
+    if do_scheduled_sampling:
+
+      def sample(x):
+        """Multinomial sampling from a n-dimensional tensor."""
+        vocab_size = target_modality.top_dimensionality
+        samples = tf.multinomial(tf.reshape(x, [-1, vocab_size]), 1)
+        reshaped_samples = tf.reshape(samples, tf.shape(x)[:-1])
+        return tf.to_int32(reshaped_samples)
+
+      def mix_gold_sampled(gold_targets, sampled_targets):
+        return tf.where(
+            tf.less(tf.random_uniform(tf.shape(sampled_targets)),
+                    self._hparams.scheduled_sampling_gold_mixin_prob),
+            gold_targets, sampled_targets)
+
+      def sampled_results():
+        """Generate scheduled sampling results."""
+        sampled_targets = dp(sample, sharded_logits)
+        new_targets = dp(mix_gold_sampled,
+                         sharded_features["targets"], sampled_targets)
+        new_features = transformed_features
+        with tf.variable_scope(tf.get_variable_scope(), reuse=True):
+          with tf.variable_scope(target_modality.name):
+            new_features["targets"] = target_modality.targets_bottom_sharded(
+                new_targets, dp)
+          with tf.variable_scope("body"):
+            body_outputs, losses = self.model_fn_body_sharded(new_features)
+            if not isinstance(losses, dict):  # If it's a single extra loss.
+              losses = {"extra": losses}
+          with tf.variable_scope(target_modality.name):
+            new_sharded_logits = target_modality.top_sharded(
+                body_outputs, sharded_features["targets"], dp)
+            training_loss = target_modality.loss_sharded(
+                sharded_logits, sharded_features["targets"], dp)
+            training_loss *= self._problem_hparams.loss_multiplier
+          losses["training"] = training_loss
+        return new_sharded_logits, losses
+      # Run the above conditionally.
+      prob = self._hparams.scheduled_sampling_prob
+      prob *= common_layers.inverse_exp_decay(
+          self._hparams.scheduled_sampling_warmup_steps, min_value=0.001)
+      sharded_logits, losses = tf.cond(
+          tf.less(tf.random_uniform([]), prob),
+          sampled_results,
+          lambda: (sharded_logits, losses))
 
     tf.logging.info("This model_fn took %.3f sec." % (time.time() - start_time))
-    losses["training"] = training_loss
     return sharded_logits, losses
 
   def model_fn_body_sharded(self, sharded_features):
