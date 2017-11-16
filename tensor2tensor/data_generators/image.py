@@ -24,6 +24,7 @@ import io
 import json
 import os
 import random
+import struct
 import tarfile
 import zipfile
 
@@ -50,15 +51,17 @@ def resize_by_area(img, size):
 
 class ImageProblem(problem.Problem):
 
-  def example_reading_spec(self, label_key=None):
-    if label_key is None:
-      label_key = "image/class/label"
+  def example_reading_spec(self, label_repr=None):
+    if label_repr is None:
+      label_repr = ("image/class/label", tf.FixedLenFeature((1,), tf.int64))
 
     data_fields = {
         "image/encoded": tf.FixedLenFeature((), tf.string),
         "image/format": tf.FixedLenFeature((), tf.string),
-        label_key: tf.VarLenFeature(tf.int64)
     }
+    label_key, label_type = label_repr  # pylint: disable=unpacking-non-sequence
+    data_fields[label_key] = label_type
+
     data_items_to_decoders = {
         "inputs":
             tf.contrib.slim.tfexample_decoder.Image(
@@ -243,8 +246,9 @@ class ImageFSNS(ImageProblem):
 
   def example_reading_spec(self):
     label_key = "image/unpadded_label"
+    label_type = tf.VarLenFeature(tf.int64)
     return super(ImageFSNS, self).example_reading_spec(
-        self, label_key=label_key)
+        self, label_repr=(label_key, label_type))
 
 
 class Image2ClassProblem(ImageProblem):
@@ -282,10 +286,8 @@ class Image2ClassProblem(ImageProblem):
 
   def hparams(self, defaults, unused_model_hparams):
     p = defaults
-    small_modality = "%s:small_image_modality" % registry.Modalities.IMAGE
-    modality = small_modality if self.is_small else registry.Modalities.IMAGE
-    p.input_modality = {"inputs": (modality, None)}
-    p.target_modality = ("%s:2d" % registry.Modalities.CLASS_LABEL,
+    p.input_modality = {"inputs": (registry.Modalities.IMAGE, None)}
+    p.target_modality = (registry.Modalities.CLASS_LABEL,
                          self.num_classes)
     p.batch_size_multiplier = 4 if self.is_small else 256
     p.max_expected_batch_size_per_shard = 8 if self.is_small else 2
@@ -378,6 +380,38 @@ class ImageImagenet32(Image2ClassProblem):
       example = imagenet_preprocess_example(example, mode)
       example["inputs"] = tf.to_int64(
           tf.image.resize_images(example["inputs"], [32, 32]))
+    return example
+
+
+@registry.register_problem
+class ImageImagenet64(Image2ClassProblem):
+  """Imagenet rescaled to 64x64."""
+
+  def dataset_filename(self):
+    return "image_imagenet"  # Reuse Imagenet data.
+
+  @property
+  def is_small(self):
+    return True  # Modalities like for CIFAR.
+
+  @property
+  def num_classes(self):
+    return 1000
+
+  def generate_data(self, data_dir, tmp_dir, task_id=-1):
+    # TODO(lukaszkaiser): find a better way than printing this.
+    print("To generate the ImageNet dataset in the proper format, follow "
+          "instructions at https://github.com/tensorflow/models/blob/master"
+          "/inception/README.md#getting-started")
+
+  def preprocess_example(self, example, mode, unused_hparams):
+    inputs = example["inputs"]
+    # Just resize with area.
+    if self._was_reversed:
+      example["inputs"] = resize_by_area(inputs, 64)
+    else:
+      example = imagenet_preprocess_example(example, mode)
+      example["inputs"] = example["inputs"] = resize_by_area(inputs, 64)
     return example
 
 
@@ -622,9 +656,11 @@ class ImageCifar10Tune(ImageMnistTune):
     ]
 
   def preprocess_example(self, example, mode, unused_hparams):
+    example["inputs"].set_shape([_CIFAR10_IMAGE_SIZE, _CIFAR10_IMAGE_SIZE, 3])
     if mode == tf.estimator.ModeKeys.TRAIN:
       example["inputs"] = common_layers.cifar_image_augmentation(
           example["inputs"])
+    example["inputs"] = tf.to_int64(example["inputs"])
     return example
 
   def generator(self, data_dir, tmp_dir, is_training):
@@ -648,6 +684,7 @@ class ImageCifar10(ImageCifar10Tune):
 class ImageCifar10Plain(ImageCifar10):
 
   def preprocess_example(self, example, mode, unused_hparams):
+    example["inputs"].set_shape([_CIFAR10_IMAGE_SIZE, _CIFAR10_IMAGE_SIZE, 3])
     example["inputs"] = tf.to_int64(example["inputs"])
     return example
 
@@ -925,3 +962,58 @@ class ImageMsCocoTokens32k(ImageMsCocoTokens8k):
   @property
   def targeted_vocab_size(self):
     return 2**15  # 32768
+
+
+@registry.register_problem
+class OcrTest(Image2TextProblem):
+  """OCR test problem."""
+
+  @property
+  def is_small(self):
+    return True
+
+  @property
+  def is_character_level(self):
+    return True
+
+  @property
+  def target_space_id(self):
+    return problem.SpaceID.EN_CHR
+
+  @property
+  def train_shards(self):
+    return 1
+
+  @property
+  def dev_shards(self):
+    return 1
+
+  def preprocess_example(self, example, mode, _):
+    # Resize from usual size ~1350x60 to 90x4 in this test.
+    img = example["inputs"]
+    example["inputs"] = tf.to_int64(
+        tf.image.resize_images(img, [90, 4], tf.image.ResizeMethod.AREA))
+    return example
+
+  def generator(self, data_dir, tmp_dir, is_training):
+    # In this test problem, we assume that the data is in tmp_dir/ocr/ in
+    # files names 0.png, 0.txt, 1.png, 1.txt and so on until num_examples.
+    num_examples = 2
+    ocr_dir = os.path.join(tmp_dir, "ocr/")
+    tf.logging.info("Looking for OCR data in %s." % ocr_dir)
+    for i in xrange(num_examples):
+      image_filepath = os.path.join(ocr_dir, "%d.png" % i)
+      text_filepath = os.path.join(ocr_dir, "%d.txt" % i)
+      with tf.gfile.Open(text_filepath, "rb") as f:
+        label = f.read()
+      with tf.gfile.Open(image_filepath, "rb") as f:
+        encoded_image_data = f.read()
+      # In PNG files width and height are stored in these bytes.
+      width, height = struct.unpack(">ii", encoded_image_data[16:24])
+      yield {
+          "image/encoded": [encoded_image_data],
+          "image/format": ["png"],
+          "image/class/label": label.strip(),
+          "image/height": [height],
+          "image/width": [width]
+      }
